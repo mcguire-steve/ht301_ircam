@@ -32,47 +32,22 @@
 *  POSSIBILITY OF SUCH DAMAGE.
 *********************************************************************/
 #include <ros/ros.h>
-#include <pluginlib/class_list_macros.h>
-#include <nodelet/nodelet.h>
 
-#include "libuvc_camera/camera_driver.h"
+#include "ht301_ircam/camera_driver.h"
 
-namespace libuvc_camera {
+int main (int argc, char **argv) {
+  ros::init(argc, argv, "ht301_ircam");
+  ros::NodeHandle nh;
+  ros::NodeHandle priv_nh("~");
 
-class CameraNodelet : public nodelet::Nodelet {
-public:
-  CameraNodelet() : running_(false) {}
-  ~CameraNodelet();
+  ht301_ircam::HT301CameraDriver driver(nh, priv_nh);
 
-private:
-  virtual void onInit();
+  if (!driver.Start())
+    return -1;
 
-  volatile bool running_;
-  boost::shared_ptr<CameraDriver> driver_;
-};
+  ros::spin();
 
-CameraNodelet::~CameraNodelet() {
-  if (running_) {
-    driver_->Stop();
-  }
+  driver.Stop();
+
+  return 0;
 }
-
-void CameraNodelet::onInit() {
-  ros::NodeHandle nh(getNodeHandle());
-  ros::NodeHandle priv_nh(getPrivateNodeHandle());
-
-  driver_.reset(new CameraDriver(nh, priv_nh));
-  if (driver_->Start()) {
-    running_ = true;
-  } else {
-    NODELET_ERROR("Unable to open camera.");
-    driver_.reset();
-  }
-}
-
-};
-
-// Register this plugin with pluginlib.
-//
-// parameters are: class type, base class type
-PLUGINLIB_EXPORT_CLASS(libuvc_camera::CameraNodelet, nodelet::Nodelet)

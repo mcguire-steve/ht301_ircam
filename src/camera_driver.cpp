@@ -31,32 +31,44 @@
 *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 *  POSSIBILITY OF SUCH DAMAGE.
 *********************************************************************/
-#include "libuvc_camera/camera_driver.h"
+#include "ht301_ircam/camera_driver.h"
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <std_msgs/Header.h>
 #include <image_transport/camera_publisher.h>
-#include <dynamic_reconfigure/server.h>
+#include <ht301_msgs/Ht301MetaData.h>
+
 #include <libuvc/libuvc.h>
 #define libuvc_VERSION (libuvc_VERSION_MAJOR * 10000 \
                       + libuvc_VERSION_MINOR * 100 \
                       + libuvc_VERSION_PATCH)
 
-namespace libuvc_camera {
+namespace ht301_ircam {
 
-CameraDriver::CameraDriver(ros::NodeHandle nh, ros::NodeHandle priv_nh)
+HT301CameraDriver::HT301CameraDriver(ros::NodeHandle nh, ros::NodeHandle priv_nh)
   : nh_(nh), priv_nh_(priv_nh),
     state_(kInitial),
     ctx_(NULL), dev_(NULL), devh_(NULL), rgb_frame_(NULL),
     it_(nh_),
-    config_server_(mutex_, priv_nh_),
-    config_changed_(false),
     cinfo_manager_(nh) {
-  cam_pub_ = it_.advertiseCamera("image_raw", 1, false);
+  raw_pub_ = it_.advertiseCamera("image_raw", 1, false);
+  rgb_pub_ = it_.advertiseCamera("image_rgb", 1, false);
+  meta_pub_ = nh_.advertise<ht301_msgs::Ht301MetaData>("metadata", 5, false);
+  
+  priv_nh_.param<std::string>("vendor", vendor, "0x0");
+  priv_nh_.param<std::string>("product", product, "0x0");
+  priv_nh_.param<std::string>("serial", serial, "");
+  priv_nh_.param<std::string>("video_mode", video_mode, "YUYV");
+  priv_nh_.param<std::string>("frame_id", frame_id, "ircam");
+  priv_nh_.param<int32_t>("index", index, 0);
+  priv_nh_.param<int32_t>("width", width, 640);
+  priv_nh_.param<int32_t>("height", height, 480);
+  priv_nh_.param<int32_t>("frame_rate", frame_rate, 30);
+
 }
 
-CameraDriver::~CameraDriver() {
+HT301CameraDriver::~HT301CameraDriver() {
   if (rgb_frame_)
     uvc_free_frame(rgb_frame_);
 
@@ -64,7 +76,7 @@ CameraDriver::~CameraDriver() {
     uvc_exit(ctx_);  // Destroys dev_, devh_, etc.
 }
 
-bool CameraDriver::Start() {
+bool HT301CameraDriver::Start() {
   assert(state_ == kInitial);
 
   uvc_error_t err;
@@ -77,13 +89,11 @@ bool CameraDriver::Start() {
   }
 
   state_ = kStopped;
-
-  config_server_.setCallback(boost::bind(&CameraDriver::ReconfigureCallback, this, _1, _2));
-
+  OpenCamera();
   return state_ == kRunning;
 }
 
-void CameraDriver::Stop() {
+void HT301CameraDriver::Stop() {
   boost::recursive_mutex::scoped_lock lock(mutex_);
 
   assert(state_ != kInitial);
@@ -99,109 +109,71 @@ void CameraDriver::Stop() {
   state_ = kInitial;
 }
 
-void CameraDriver::ReconfigureCallback(UVCCameraConfig &new_config, uint32_t level) {
-  boost::recursive_mutex::scoped_lock lock(mutex_);
-
-  if ((level & kReconfigureClose) == kReconfigureClose) {
-    if (state_ == kRunning)
-      CloseCamera();
-  }
-
-  if (state_ == kStopped) {
-    OpenCamera(new_config);
-  }
-
-  if (new_config.camera_info_url != config_.camera_info_url)
-    cinfo_manager_.loadCameraInfo(new_config.camera_info_url);
-
-  if (state_ == kRunning) {
-#define PARAM_INT(name, fn, value) if (new_config.name != config_.name) { \
-      int val = (value);                                                \
-      if (uvc_set_##fn(devh_, val)) {                                   \
-        ROS_WARN("Unable to set " #name " to %d", val);                 \
-        new_config.name = config_.name;                                 \
-      }                                                                 \
-    }
-
-    PARAM_INT(scanning_mode, scanning_mode, new_config.scanning_mode);
-    PARAM_INT(auto_exposure, ae_mode, 1 << new_config.auto_exposure);
-    PARAM_INT(auto_exposure_priority, ae_priority, new_config.auto_exposure_priority);
-    PARAM_INT(exposure_absolute, exposure_abs, new_config.exposure_absolute * 10000);
-    PARAM_INT(auto_focus, focus_auto, new_config.auto_focus ? 1 : 0);
-    PARAM_INT(focus_absolute, focus_abs, new_config.focus_absolute);
-#if libuvc_VERSION     > 00005 /* version > 0.0.5 */
-    PARAM_INT(gain, gain, new_config.gain);
-    PARAM_INT(iris_absolute, iris_abs, new_config.iris_absolute);
-    PARAM_INT(brightness, brightness, new_config.brightness);
-#endif
-    
-
-    if (new_config.pan_absolute != config_.pan_absolute || new_config.tilt_absolute != config_.tilt_absolute) {
-      if (uvc_set_pantilt_abs(devh_, new_config.pan_absolute, new_config.tilt_absolute)) {
-        ROS_WARN("Unable to set pantilt to %d, %d", new_config.pan_absolute, new_config.tilt_absolute);
-        new_config.pan_absolute = config_.pan_absolute;
-        new_config.tilt_absolute = config_.tilt_absolute;
-      }
-    }
-    // TODO: roll_absolute
-    // TODO: privacy
-    // TODO: backlight_compensation
-    // TODO: contrast
-    // TODO: power_line_frequency
-    // TODO: auto_hue
-    // TODO: saturation
-    // TODO: sharpness
-    // TODO: gamma
-    // TODO: auto_white_balance
-    // TODO: white_balance_temperature
-    // TODO: white_balance_BU
-    // TODO: white_balance_RV
-  }
-
-  config_ = new_config;
-}
-
-void CameraDriver::ImageCallback(uvc_frame_t *frame) {
+void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   ros::Time timestamp = ros::Time(frame->capture_time.tv_sec, frame->capture_time.tv_usec * 1000);
   if ( timestamp == ros::Time(0) ) {
     timestamp = ros::Time::now();
   }
 
+  if (frame->data_bytes < frame->width*frame->height*2)
+    {
+      ROS_INFO("Incomplete frame recv, skipping");
+      return;
+    }
+  
   boost::recursive_mutex::scoped_lock lock(mutex_);
 
   assert(state_ == kRunning);
   assert(rgb_frame_);
 
-  sensor_msgs::Image::Ptr image(new sensor_msgs::Image());
-  image->width = config_.width;
-  image->height = config_.height;
-  image->step = image->width * 3;
-  image->data.resize(image->step * image->height);
+  sensor_msgs::Image::Ptr rgb_image(new sensor_msgs::Image());
+  sensor_msgs::Image::Ptr raw_image(new sensor_msgs::Image());
+  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
+  raw_image->width = width;
+  raw_image->height = height;
+  raw_image->encoding = "YUV422";
+  raw_image->step = width * 2;
+  raw_image->data.resize(raw_image->step * raw_image->height);
+  memcpy(&(raw_image->data[0]), frame->data, frame->data_bytes);
+
+  //Trim the bottom 4 rows
+
+  uint32_t metaStart = raw_image->step * (raw_image->height - 4);
+  metadata->header.stamp = timestamp;
+  metadata->width = raw_image->step;
+  metadata->data.resize(raw_image->step * 4);
+  memcpy(&(metadata->data[0]), frame->data + metaStart, raw_image->step * 4);
+  meta_pub_.publish(metadata);
+  
+  rgb_image->width = width;
+  rgb_image->height = height - 4;
+  rgb_image->step = rgb_image->width * 3;
+  rgb_image->data.resize(rgb_image->step * rgb_image->height);
 
   if (frame->frame_format == UVC_FRAME_FORMAT_BGR){
-    image->encoding = "bgr8";
-    memcpy(&(image->data[0]), frame->data, frame->data_bytes);
+    rgb_image->encoding = "bgr8";
+    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
   } else if (frame->frame_format == UVC_FRAME_FORMAT_RGB){
-    image->encoding = "rgb8";
-    memcpy(&(image->data[0]), frame->data, frame->data_bytes);
+    rgb_image->encoding = "rgb8";
+    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
   } else if (frame->frame_format == UVC_FRAME_FORMAT_UYVY) {
     uvc_error_t conv_ret = uvc_uyvy2bgr(frame, rgb_frame_);
     if (conv_ret != UVC_SUCCESS) {
       uvc_perror(conv_ret, "Couldn't convert frame to RGB");
       return;
     }
-    image->encoding = "bgr8";
-    memcpy(&(image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
+    rgb_image->encoding = "bgr8";
+    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
   } else if (frame->frame_format == UVC_FRAME_FORMAT_GRAY8) {
-    image->encoding = "8UC1";
-    image->step = image->width;
-    image->data.resize(image->step * image->height);
-    memcpy(&(image->data[0]), frame->data, frame->data_bytes);
+    rgb_image->encoding = "8UC1";
+    rgb_image->step = rgb_image->width;
+    rgb_image->data.resize(rgb_image->step * rgb_image->height);
+    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
   } else if (frame->frame_format == UVC_FRAME_FORMAT_GRAY16) {
-    image->encoding = "16UC1";
-    image->step = image->width*2;
-    image->data.resize(image->step * image->height);
-    memcpy(&(image->data[0]), frame->data, frame->data_bytes);
+    rgb_image->encoding = "16UC1";
+    rgb_image->step = rgb_image->width*2;
+    rgb_image->data.resize(rgb_image->step * rgb_image->height);
+    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
   } else if (frame->frame_format == UVC_FRAME_FORMAT_YUYV) {
     // FIXME: uvc_any2bgr does not work on "yuyv" format, so use uvc_yuyv2bgr directly.
     uvc_error_t conv_ret = uvc_yuyv2bgr(frame, rgb_frame_);
@@ -209,8 +181,8 @@ void CameraDriver::ImageCallback(uvc_frame_t *frame) {
       uvc_perror(conv_ret, "Couldn't convert frame to RGB");
       return;
     }
-    image->encoding = "bgr8";
-    memcpy(&(image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
+    rgb_image->encoding = "bgr8";
+    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_image->step * rgb_image->height);
 #if libuvc_VERSION     > 00005 /* version > 0.0.5 */
   } else if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
     // Enable mjpeg support despite uvs_any2bgr shortcoming
@@ -220,8 +192,8 @@ void CameraDriver::ImageCallback(uvc_frame_t *frame) {
       uvc_perror(conv_ret, "Couldn't convert frame to RGB");
       return;
     }
-    image->encoding = "rgb8";
-    memcpy(&(image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
+    rgb_image->encoding = "rgb8";
+    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
 #endif
   } else {
     uvc_error_t conv_ret = uvc_any2bgr(frame, rgb_frame_);
@@ -229,89 +201,34 @@ void CameraDriver::ImageCallback(uvc_frame_t *frame) {
       uvc_perror(conv_ret, "Couldn't convert frame to RGB");
       return;
     }
-    image->encoding = "bgr8";
-    memcpy(&(image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
+    rgb_image->encoding = "bgr8";
+    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
   }
 
 
   sensor_msgs::CameraInfo::Ptr cinfo(
     new sensor_msgs::CameraInfo(cinfo_manager_.getCameraInfo()));
 
-  image->header.frame_id = config_.frame_id;
-  image->header.stamp = timestamp;
-  cinfo->header.frame_id = config_.frame_id;
+  rgb_image->header.frame_id = frame_id;
+  rgb_image->header.stamp = timestamp;
+  cinfo->header.frame_id = frame_id;
   cinfo->header.stamp = timestamp;
+  cinfo->width = rgb_image->width;
+  cinfo->height = rgb_image->height;
+  rgb_pub_.publish(rgb_image, cinfo);
 
-  cam_pub_.publish(image, cinfo);
+  raw_pub_.publish(raw_image, cinfo); //not quite right...
 
-  if (config_changed_) {
-    config_server_.updateConfig(config_);
-    config_changed_ = false;
-  }
 }
 
-/* static */ void CameraDriver::ImageCallbackAdapter(uvc_frame_t *frame, void *ptr) {
-  CameraDriver *driver = static_cast<CameraDriver*>(ptr);
+/* static */ void HT301CameraDriver::ImageCallbackAdapter(uvc_frame_t *frame, void *ptr) {
+  HT301CameraDriver *driver = static_cast<HT301CameraDriver*>(ptr);
 
   driver->ImageCallback(frame);
 }
 
-void CameraDriver::AutoControlsCallback(
-  enum uvc_status_class status_class,
-  int event,
-  int selector,
-  enum uvc_status_attribute status_attribute,
-  void *data, size_t data_len) {
-  boost::recursive_mutex::scoped_lock lock(mutex_);
 
-  printf("Controls callback. class: %d, event: %d, selector: %d, attr: %d, data_len: %zu\n",
-         status_class, event, selector, status_attribute, data_len);
-
-  if (status_attribute == UVC_STATUS_ATTRIBUTE_VALUE_CHANGE) {
-    switch (status_class) {
-    case UVC_STATUS_CLASS_CONTROL_CAMERA: {
-      switch (selector) {
-      case UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
-        uint8_t *data_char = (uint8_t*) data;
-        uint32_t exposure_int = ((data_char[0]) | (data_char[1] << 8) |
-                                 (data_char[2] << 16) | (data_char[3] << 24));
-        config_.exposure_absolute = exposure_int * 0.0001;
-        config_changed_ = true;
-        break;
-      }
-      break;
-    }
-    case UVC_STATUS_CLASS_CONTROL_PROCESSING: {
-      switch (selector) {
-      case UVC_PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
-        uint8_t *data_char = (uint8_t*) data;
-        config_.white_balance_temperature = 
-          data_char[0] | (data_char[1] << 8);
-        config_changed_ = true;
-        break;
-      }
-      break;
-    }
-    }
-
-    // config_server_.updateConfig(config_);
-  }
-}
-
-/* static */ void CameraDriver::AutoControlsCallbackAdapter(
-  enum uvc_status_class status_class,
-  int event,
-  int selector,
-  enum uvc_status_attribute status_attribute,
-  void *data, size_t data_len,
-  void *ptr) {
-  CameraDriver *driver = static_cast<CameraDriver*>(ptr);
-
-  driver->AutoControlsCallback(status_class, event, selector,
-                               status_attribute, data, data_len);
-}
-
-enum uvc_frame_format CameraDriver::GetVideoMode(std::string vmode){
+enum uvc_frame_format HT301CameraDriver::GetVideoMode(std::string vmode){
   if(vmode == "uncompressed") {
     return UVC_COLOR_FORMAT_UNCOMPRESSED;
   } else if (vmode == "compressed") {
@@ -337,14 +254,14 @@ enum uvc_frame_format CameraDriver::GetVideoMode(std::string vmode){
   }
 };
 
-void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
+void HT301CameraDriver::OpenCamera() {
   assert(state_ == kStopped);
 
-  int vendor_id = strtol(new_config.vendor.c_str(), NULL, 0);
-  int product_id = strtol(new_config.product.c_str(), NULL, 0);
+  int vendor_id = strtol(vendor.c_str(), NULL, 0);
+  int product_id = strtol(product.c_str(), NULL, 0);
 
   ROS_INFO("Opening camera with vendor=0x%x, product=0x%x, serial=\"%s\", index=%d",
-           vendor_id, product_id, new_config.serial.c_str(), new_config.index);
+           vendor_id, product_id, serial.c_str(), index);
 
   uvc_device_t **devs;
 
@@ -355,7 +272,7 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
     ctx_, &devs,
     vendor_id,
     product_id,
-    new_config.serial.empty() ? NULL : new_config.serial.c_str());
+    serial.empty() ? NULL : serial.c_str());
 
   if (find_err != UVC_SUCCESS) {
     uvc_perror(find_err, "uvc_find_device");
@@ -366,7 +283,7 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
   dev_ = NULL;
   int dev_idx = 0;
   while (devs[dev_idx] != NULL) {
-    if(dev_idx == new_config.index) {
+    if(dev_idx == index) {
       dev_ = devs[dev_idx];
     }
     else {
@@ -377,7 +294,7 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
   }
 
   if(dev_ == NULL) {
-    ROS_ERROR("Unable to find device at index %d", new_config.index);
+    ROS_ERROR("Unable to find device at index %d", index);
     return;
   }
 #else
@@ -385,7 +302,7 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
     ctx_, &dev_,
     vendor_id,
     product_id,
-    new_config.serial.empty() ? NULL : new_config.serial.c_str());
+    serial.empty() ? NULL : serial.c_str());
 
   if (find_err != UVC_SUCCESS) {
     uvc_perror(find_err, "uvc_find_device");
@@ -422,15 +339,14 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
     uvc_unref_device(dev_);
     return;
   }
-
-  uvc_set_status_callback(devh_, &CameraDriver::AutoControlsCallbackAdapter, this);
+ uvc_print_diag(devh_, stderr);
 
   uvc_stream_ctrl_t ctrl;
   uvc_error_t mode_err = uvc_get_stream_ctrl_format_size(
     devh_, &ctrl,
-    GetVideoMode(new_config.video_mode),
-    new_config.width, new_config.height,
-    new_config.frame_rate);
+    GetVideoMode(video_mode),
+    width, height,
+    frame_rate);
 
   if (mode_err != UVC_SUCCESS) {
     uvc_perror(mode_err, "uvc_get_stream_ctrl_format_size");
@@ -441,7 +357,7 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
     return;
   }
 
-  uvc_error_t stream_err = uvc_start_streaming(devh_, &ctrl, &CameraDriver::ImageCallbackAdapter, this, 0);
+  uvc_error_t stream_err = uvc_start_streaming(devh_, &ctrl, &HT301CameraDriver::ImageCallbackAdapter, this, 0);
 
   if (stream_err != UVC_SUCCESS) {
     uvc_perror(stream_err, "uvc_start_streaming");
@@ -453,13 +369,13 @@ void CameraDriver::OpenCamera(UVCCameraConfig &new_config) {
   if (rgb_frame_)
     uvc_free_frame(rgb_frame_);
 
-  rgb_frame_ = uvc_allocate_frame(new_config.width * new_config.height * 3);
+  rgb_frame_ = uvc_allocate_frame(width * height * 3);
   assert(rgb_frame_);
 
   state_ = kRunning;
 }
 
-void CameraDriver::CloseCamera() {
+void HT301CameraDriver::CloseCamera() {
   assert(state_ == kRunning);
 
   uvc_close(devh_);

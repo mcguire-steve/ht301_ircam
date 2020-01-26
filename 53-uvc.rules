@@ -1,0 +1,8 @@
+# UVC cameras
+SUBSYSTEMS=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0a66", MODE="0666"
+SUBSYSTEMS=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="04f2", ATTRS{idProduct}=="b2ea", MODE="0666"
+SUBSYSTEMS=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="041e", ATTRS{idProduct}=="04f2", MODE="0666"
+SUBSYSTEMS=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f9", MODE="0666"
+SUBSYSTEMS=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="1514", ATTRS{idProduct}=="0001", MODE="0666"
+
+# ^ Change the vendor and product IDs to match your camera.

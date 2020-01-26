@@ -1,0 +1,9 @@
+<library path="lib/libht301_ircam_nodelet">
+  <class name="ht301_ircam/driver"
+         type="ht301_ircam::CameraNodelet"
+         base_class_type="nodelet::Nodelet">
+    <description> 
+      HT301 IR camera driver nodelet.
+    </description>
+  </class>
+</library>
