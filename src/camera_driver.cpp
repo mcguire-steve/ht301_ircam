@@ -40,6 +40,14 @@
 #include <ht301_msgs/Ht301MetaData.h>
 
 #include <libuvc/libuvc.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/highgui/highgui_c.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <opencv2/imgproc/imgproc.hpp>
+
 #define libuvc_VERSION (libuvc_VERSION_MAJOR * 10000 \
                       + libuvc_VERSION_MINOR * 100 \
                       + libuvc_VERSION_PATCH)
@@ -53,7 +61,9 @@ HT301CameraDriver::HT301CameraDriver(ros::NodeHandle nh, ros::NodeHandle priv_nh
     it_(nh_),
     cinfo_manager_(nh) {
   raw_pub_ = it_.advertiseCamera("image_raw", 1, false);
-  //rgb_pub_ = it_.advertiseCamera("image_rgb", 1, false);
+
+  mono_pub_ = it_.advertiseCamera("image_mono", 1, false);
+
   therm_pub_ = it_.advertiseCamera("image_thermal", 1, false);
   
   meta_pub_ = nh_.advertise<ht301_msgs::Ht301MetaData>("metadata", 5, false);
@@ -173,6 +183,63 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
 
   ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
   
+  therm_image->header.stamp = timestamp; 
+  therm_image->width = width;
+  therm_image->height = height - 4;
+  therm_image->encoding = "32FC1";
+  therm_image->step = width * sizeof(float);
+  therm_image->data.resize(therm_image->step * therm_image->height); //float sizeof is in the step
+  
+  
+  //Load the lookup table
+  UpdateParam (0, (unsigned char*) frame->data); //for each frame
+  //The first parameter might be inverted
+  GetTmpData (0, (unsigned char*)frame->data, &maxtmp, &maxx, &maxy, &mintmp, &minx, &miny, &centertmp, tmparr, temperatureLUT);
+
+
+
+
+ 
+  
+	
+  //use the LUT to figure out each pixel's float val
+  for (uint32_t i=0; i<(raw_image->step*(raw_image->height-4)); i+=2)
+    {
+      uint16_t raw_val = *(uint16_t*)&raw_image->data[i];
+      //ROS_INFO("Data val: %u", raw_val);
+      float real_temp;
+      if (raw_val > 16384)
+	{
+	  real_temp = 0.0f;
+	}
+      else
+	{
+	  real_temp = temperatureLUT[raw_val];
+	}
+      //ROS_INFO("Temp val: %1.2f", real_temp);
+      memcpy(&therm_image->data[i*2], &real_temp, sizeof(float));
+    }
+  
+  cv::Mat mono8_img = cv::Mat(height-4, width , CV_8UC1);
+  cv_bridge::CvImageConstPtr therm_mat = cv_bridge::toCvShare(therm_image, "");
+
+  /*
+  for (int i = 0; i< therm_image->width*therm_image->height; i++)
+    {
+      ROS_INFO("Pixel: %d Temp: %1.2f", i, therm_mat->image.at<float>(i));
+    }
+  */
+  
+  cv::convertScaleAbs(cv_bridge::toCvShare(therm_image, "")->image, mono8_img, 2, 0.0);
+  cv_bridge::CvImagePtr cvThermImage = boost::make_shared<cv_bridge::CvImage>(therm_image->header, "mono8", mono8_img);
+
+  /*
+  cv::namedWindow("therm_view", cv::WINDOW_NORMAL);
+  cv::imshow("therm_view", cv_bridge::cvtColor(cvThermImage,"bgra8")->image);
+  cv::waitKey(10);
+  */
+  
+  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
 
   //Push as gray16 image: mono16 for raw values
   //Float data: TYPE_32FC1
@@ -189,12 +256,12 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   metadata->miny = miny;
   metadata->centerTemp = centertmp;
   meta_pub_.publish(metadata);
-  
-  rgb_image->width = width;
-  rgb_image->height = height - 4;
+
+  /*
+  mono_image->width = width;
+  mono_image->height = height - 4;
   rgb_image->step = rgb_image->width * 3;
   //rgb_image->data.resize(rgb_image->step * rgb_image->height);
-
 
 
 
@@ -209,7 +276,8 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   cinfo->width = raw_image->width;
   cinfo->height = raw_image->height;
 
-  //rgb_pub_.publish(rgb_image, cinfo);
+  mono_pub_.publish(cvThermImage->toImageMsg(), cinfo);
+
 
   raw_pub_.publish(raw_image, cinfo); //not quite right...
   cinfo->height = raw_image->height-4;
@@ -364,6 +432,8 @@ void HT301CameraDriver::CloseCamera() {
 
 
 void HT301CameraDriver::spin() {
+
+  ros::Rate r(10); // 10 hz
   while (ros::ok())
     {
       if (frameCount % 200 == 0)
@@ -371,6 +441,8 @@ void HT301CameraDriver::spin() {
 	   uvc_set_zoom_abs(devh_,0x8000); //calibrate
 	}
       ros::spinOnce();
+      r.sleep();
+
     }
 }
 
