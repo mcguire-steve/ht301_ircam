@@ -40,6 +40,14 @@
 #include <ht301_msgs/Ht301MetaData.h>
 
 #include <libuvc/libuvc.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/highgui/highgui_c.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <opencv2/imgproc/imgproc.hpp>
+
 #define libuvc_VERSION (libuvc_VERSION_MAJOR * 10000 \
                       + libuvc_VERSION_MINOR * 100 \
                       + libuvc_VERSION_PATCH)
@@ -53,7 +61,9 @@ HT301CameraDriver::HT301CameraDriver(ros::NodeHandle nh, ros::NodeHandle priv_nh
     it_(nh_),
     cinfo_manager_(nh) {
   raw_pub_ = it_.advertiseCamera("image_raw", 1, false);
-  rgb_pub_ = it_.advertiseCamera("image_rgb", 1, false);
+  mono_pub_ = it_.advertiseCamera("image_mono", 1, false);
+  therm_pub_ = it_.advertiseCamera("image_thermal", 1, false);
+  
   meta_pub_ = nh_.advertise<ht301_msgs::Ht301MetaData>("metadata", 5, false);
   
   priv_nh_.param<std::string>("vendor", vendor, "0x0");
@@ -115,9 +125,9 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
     timestamp = ros::Time::now();
   }
 
-  if (frame->data_bytes < frame->width*frame->height*2)
+  if (frame->data_bytes != frame->width*frame->height*2)
     {
-      ROS_INFO("Incomplete frame recv, skipping");
+      ROS_INFO("Corrupt frame recv, only %d bytes, skipping", frame->data_bytes);
       return;
     }
   
@@ -125,85 +135,111 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
 
   assert(state_ == kRunning);
   assert(rgb_frame_);
+  //Thermometry
+  float maxtmp;
+  int maxx;
+  int maxy;
+  float mintmp;
+  int minx;
+  int miny;
+  float centertmp;
+  float tmparr[3];
 
+  
   sensor_msgs::Image::Ptr rgb_image(new sensor_msgs::Image());
   sensor_msgs::Image::Ptr raw_image(new sensor_msgs::Image());
-  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
+  sensor_msgs::Image::Ptr therm_image(new sensor_msgs::Image());
+  
   raw_image->width = width;
   raw_image->height = height;
-  raw_image->encoding = "YUV422";
+  raw_image->encoding = "mono16";
   raw_image->step = width * 2;
   raw_image->data.resize(raw_image->step * raw_image->height);
   memcpy(&(raw_image->data[0]), frame->data, frame->data_bytes);
 
-  //Trim the bottom 4 rows
-
-  uint32_t metaStart = raw_image->step * (raw_image->height - 4);
-  metadata->header.stamp = timestamp;
-  metadata->width = raw_image->step;
-  metadata->data.resize(raw_image->step * 4);
-  memcpy(&(metadata->data[0]), frame->data + metaStart, raw_image->step * 4);
-  meta_pub_.publish(metadata);
+  therm_image->header.stamp = timestamp; 
+  therm_image->width = width;
+  therm_image->height = height - 4;
+  therm_image->encoding = "32FC1";
+  therm_image->step = width * sizeof(float);
+  therm_image->data.resize(therm_image->step * therm_image->height); //float sizeof is in the step
   
-  rgb_image->width = width;
-  rgb_image->height = height - 4;
-  rgb_image->step = rgb_image->width * 3;
-  rgb_image->data.resize(rgb_image->step * rgb_image->height);
+  
+  //Load the lookup table
+  UpdateParam (0, (unsigned char*) frame->data); //for each frame
+  //The first parameter might be inverted
+  GetTmpData (0, (unsigned char*)frame->data, &maxtmp, &maxx, &maxy, &mintmp, &minx, &miny, &centertmp, tmparr, temperatureLUT);
 
-  if (frame->frame_format == UVC_FRAME_FORMAT_BGR){
-    rgb_image->encoding = "bgr8";
-    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_RGB){
-    rgb_image->encoding = "rgb8";
-    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_UYVY) {
-    uvc_error_t conv_ret = uvc_uyvy2bgr(frame, rgb_frame_);
-    if (conv_ret != UVC_SUCCESS) {
-      uvc_perror(conv_ret, "Couldn't convert frame to RGB");
-      return;
+
+
+
+ 
+  
+	
+  //use the LUT to figure out each pixel's float val
+  for (uint32_t i=0; i<(raw_image->step*(raw_image->height-4)); i+=2)
+    {
+      uint16_t raw_val = *(uint16_t*)&raw_image->data[i];
+      //ROS_INFO("Data val: %u", raw_val);
+      float real_temp;
+      if (raw_val > 16384)
+	{
+	  real_temp = 0.0f;
+	}
+      else
+	{
+	  real_temp = temperatureLUT[raw_val];
+	}
+      //ROS_INFO("Temp val: %1.2f", real_temp);
+      memcpy(&therm_image->data[i*2], &real_temp, sizeof(float));
     }
-    rgb_image->encoding = "bgr8";
-    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_GRAY8) {
-    rgb_image->encoding = "8UC1";
-    rgb_image->step = rgb_image->width;
-    rgb_image->data.resize(rgb_image->step * rgb_image->height);
-    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_GRAY16) {
-    rgb_image->encoding = "16UC1";
-    rgb_image->step = rgb_image->width*2;
-    rgb_image->data.resize(rgb_image->step * rgb_image->height);
-    memcpy(&(rgb_image->data[0]), frame->data, frame->data_bytes);
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_YUYV) {
-    // FIXME: uvc_any2bgr does not work on "yuyv" format, so use uvc_yuyv2bgr directly.
-    uvc_error_t conv_ret = uvc_yuyv2bgr(frame, rgb_frame_);
-    if (conv_ret != UVC_SUCCESS) {
-      uvc_perror(conv_ret, "Couldn't convert frame to RGB");
-      return;
+  
+  cv::Mat mono8_img = cv::Mat(height-4, width , CV_8UC1);
+  cv_bridge::CvImageConstPtr therm_mat = cv_bridge::toCvShare(therm_image, "");
+
+  /*
+  for (int i = 0; i< therm_image->width*therm_image->height; i++)
+    {
+      ROS_INFO("Pixel: %d Temp: %1.2f", i, therm_mat->image.at<float>(i));
     }
-    rgb_image->encoding = "bgr8";
-    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_image->step * rgb_image->height);
-#if libuvc_VERSION     > 00005 /* version > 0.0.5 */
-  } else if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
-    // Enable mjpeg support despite uvs_any2bgr shortcoming
-    //  https://github.com/ros-drivers/libuvc_ros/commit/7508a09f
-    uvc_error_t conv_ret = uvc_mjpeg2rgb(frame, rgb_frame_);
-    if (conv_ret != UVC_SUCCESS) {
-      uvc_perror(conv_ret, "Couldn't convert frame to RGB");
-      return;
-    }
-    rgb_image->encoding = "rgb8";
-    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
-#endif
-  } else {
-    uvc_error_t conv_ret = uvc_any2bgr(frame, rgb_frame_);
-    if (conv_ret != UVC_SUCCESS) {
-      uvc_perror(conv_ret, "Couldn't convert frame to RGB");
-      return;
-    }
-    rgb_image->encoding = "bgr8";
-    memcpy(&(rgb_image->data[0]), rgb_frame_->data, rgb_frame_->data_bytes);
-  }
+  */
+  
+  cv::convertScaleAbs(cv_bridge::toCvShare(therm_image, "")->image, mono8_img, 2, 0.0);
+  cv_bridge::CvImagePtr cvThermImage = boost::make_shared<cv_bridge::CvImage>(therm_image->header, "mono8", mono8_img);
+
+  /*
+  cv::namedWindow("therm_view", cv::WINDOW_NORMAL);
+  cv::imshow("therm_view", cv_bridge::cvtColor(cvThermImage,"bgra8")->image);
+  cv::waitKey(10);
+  */
+  
+  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
+  
+
+  //Push as gray16 image: mono16 for raw values
+  //Float data: TYPE_32FC1
+  //Trim the bottom 4 rows
+  
+
+
+  metadata->header.stamp = timestamp;
+  metadata->minTemp = mintmp;
+  metadata->maxTemp = maxtmp;
+  metadata->maxx = maxx;
+  metadata->maxy = maxy;
+  metadata->minx = minx;
+  metadata->miny = miny;
+  metadata->centerTemp = centertmp;
+  meta_pub_.publish(metadata);
+
+  /*
+  mono_image->width = width;
+  mono_image->height = height - 4;
+  rgb_image->step = rgb_image->width * 3;
+  //rgb_image->data.resize(rgb_image->step * rgb_image->height);
+  */
+  
+
 
 
   sensor_msgs::CameraInfo::Ptr cinfo(
@@ -211,19 +247,25 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
 
   rgb_image->header.frame_id = frame_id;
   rgb_image->header.stamp = timestamp;
+
   cinfo->header.frame_id = frame_id;
   cinfo->header.stamp = timestamp;
-  cinfo->width = rgb_image->width;
-  cinfo->height = rgb_image->height;
-  rgb_pub_.publish(rgb_image, cinfo);
+  cinfo->width = raw_image->width;
+  cinfo->height = raw_image->height;
+
+  mono_pub_.publish(cvThermImage->toImageMsg(), cinfo);
 
   raw_pub_.publish(raw_image, cinfo); //not quite right...
-
+  cinfo->height = raw_image->height-4;
+  
+  therm_pub_.publish(therm_image, cinfo);
+  frameCount++;
+  
 }
 
 /* static */ void HT301CameraDriver::ImageCallbackAdapter(uvc_frame_t *frame, void *ptr) {
-  HT301CameraDriver *driver = static_cast<HT301CameraDriver*>(ptr);
 
+  HT301CameraDriver *driver = static_cast<HT301CameraDriver*>(ptr);
   driver->ImageCallback(frame);
 }
 
@@ -265,39 +307,6 @@ void HT301CameraDriver::OpenCamera() {
 
   uvc_device_t **devs;
 
-  // Implement missing index select behavior
-  // https://github.com/ros-drivers/libuvc_ros/commit/4f30e9a0
-#if libuvc_VERSION     > 00005 /* version > 0.0.5 */
-  uvc_error_t find_err = uvc_find_devices(
-    ctx_, &devs,
-    vendor_id,
-    product_id,
-    serial.empty() ? NULL : serial.c_str());
-
-  if (find_err != UVC_SUCCESS) {
-    uvc_perror(find_err, "uvc_find_device");
-    return;
-  }
-
-  // select device by index
-  dev_ = NULL;
-  int dev_idx = 0;
-  while (devs[dev_idx] != NULL) {
-    if(dev_idx == index) {
-      dev_ = devs[dev_idx];
-    }
-    else {
-      uvc_unref_device(devs[dev_idx]);
-    }
-
-    dev_idx++;
-  }
-
-  if(dev_ == NULL) {
-    ROS_ERROR("Unable to find device at index %d", index);
-    return;
-  }
-#else
   uvc_error_t find_err = uvc_find_device(
     ctx_, &dev_,
     vendor_id,
@@ -309,7 +318,6 @@ void HT301CameraDriver::OpenCamera() {
     return;
   }
 
-#endif
   uvc_error_t open_err = uvc_open(dev_, &devh_);
 
   if (open_err != UVC_SUCCESS) {
@@ -357,6 +365,17 @@ void HT301CameraDriver::OpenCamera() {
     return;
   }
 
+  uvc_print_stream_ctrl(&ctrl, stderr);
+
+  //Set up the thermo library
+  DataInit(width,height);
+  frameCount = 0;
+
+  //Send the magic make it work sequence
+  uvc_set_zoom_abs(devh_,0x8004); //16-bit datamode
+  uvc_set_zoom_abs(devh_,0x8000); //calibrate
+  uvc_set_zoom_abs(devh_,0x8020); //enable thermal data
+  
   uvc_error_t stream_err = uvc_start_streaming(devh_, &ctrl, &HT301CameraDriver::ImageCallbackAdapter, this, 0);
 
   if (stream_err != UVC_SUCCESS) {
@@ -385,6 +404,21 @@ void HT301CameraDriver::CloseCamera() {
   dev_ = NULL;
 
   state_ = kStopped;
+}
+
+
+void HT301CameraDriver::spin() {
+  ros::Rate r(10); // 10 hz
+  while (ros::ok())
+    {
+      
+      if (frameCount % 200 == 0)
+	{
+	   uvc_set_zoom_abs(devh_,0x8000); //calibrate
+	}
+      ros::spinOnce();
+      r.sleep();
+    }
 }
 
 };

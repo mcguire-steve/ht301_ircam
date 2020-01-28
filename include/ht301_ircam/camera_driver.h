@@ -8,6 +8,7 @@
 #include <dynamic_reconfigure/server.h>
 #include <camera_info_manager/camera_info_manager.h>
 #include <boost/thread/mutex.hpp>
+#include <ht301_ircam/XthermDll.h>
 
 namespace ht301_ircam {
 
@@ -18,7 +19,8 @@ public:
 
   bool Start();
   void Stop();
-
+  void spin();
+  
 private:
   enum State {
     kInitial = 0,
@@ -66,6 +68,8 @@ private:
   uvc_device_handle_t *devh_;
   uvc_frame_t *rgb_frame_;
 
+  float temperatureLUT[16384];
+  
   std::string vendor;
   std::string product;
   std::string serial;
@@ -75,10 +79,12 @@ private:
   int32_t width;
   int32_t height;
   int32_t frame_rate;
+  uint8_t frameCount;
   
   image_transport::ImageTransport it_;
   image_transport::CameraPublisher raw_pub_;
-  image_transport::CameraPublisher rgb_pub_;
+  image_transport::CameraPublisher mono_pub_;
+  image_transport::CameraPublisher therm_pub_;
   
   ros::Publisher meta_pub_;
   
