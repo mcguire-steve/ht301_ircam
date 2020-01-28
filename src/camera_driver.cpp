@@ -181,8 +181,7 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
 	therm_image->data[i] = temperatureLUT[raw_image->data[i]]; //bounds checking, etc 
     }
 
-  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
-  
+
   therm_image->header.stamp = timestamp; 
   therm_image->width = width;
   therm_image->height = height - 4;
@@ -196,30 +195,6 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   //The first parameter might be inverted
   GetTmpData (0, (unsigned char*)frame->data, &maxtmp, &maxx, &maxy, &mintmp, &minx, &miny, &centertmp, tmparr, temperatureLUT);
 
-
-
-
- 
-  
-	
-  //use the LUT to figure out each pixel's float val
-  for (uint32_t i=0; i<(raw_image->step*(raw_image->height-4)); i+=2)
-    {
-      uint16_t raw_val = *(uint16_t*)&raw_image->data[i];
-      //ROS_INFO("Data val: %u", raw_val);
-      float real_temp;
-      if (raw_val > 16384)
-	{
-	  real_temp = 0.0f;
-	}
-      else
-	{
-	  real_temp = temperatureLUT[raw_val];
-	}
-      //ROS_INFO("Temp val: %1.2f", real_temp);
-      memcpy(&therm_image->data[i*2], &real_temp, sizeof(float));
-    }
-  
   cv::Mat mono8_img = cv::Mat(height-4, width , CV_8UC1);
   cv_bridge::CvImageConstPtr therm_mat = cv_bridge::toCvShare(therm_image, "");
 
@@ -238,15 +213,13 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   cv::imshow("therm_view", cv_bridge::cvtColor(cvThermImage,"bgra8")->image);
   cv::waitKey(10);
   */
-  
+
   ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
 
   //Push as gray16 image: mono16 for raw values
   //Float data: TYPE_32FC1
   //Trim the bottom 4 rows
   
-
-
   metadata->header.stamp = timestamp;
   metadata->minTemp = mintmp;
   metadata->maxTemp = maxtmp;
@@ -256,14 +229,6 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   metadata->miny = miny;
   metadata->centerTemp = centertmp;
   meta_pub_.publish(metadata);
-
-  /*
-  mono_image->width = width;
-  mono_image->height = height - 4;
-  rgb_image->step = rgb_image->width * 3;
-  //rgb_image->data.resize(rgb_image->step * rgb_image->height);
-
-
 
   sensor_msgs::CameraInfo::Ptr cinfo(
     new sensor_msgs::CameraInfo(cinfo_manager_.getCameraInfo()));
