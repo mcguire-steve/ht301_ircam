@@ -57,6 +57,7 @@ HT301CameraNodelet::~HT301CameraNodelet() {
   }
 }
 
+  ///Needs someway to call spin() to get the cal thing every 200 frames
 void HT301CameraNodelet::onInit() {
   ros::NodeHandle nh(getNodeHandle());
   ros::NodeHandle priv_nh(getPrivateNodeHandle());

@@ -45,7 +45,7 @@ int main (int argc, char **argv) {
   if (!driver.Start())
     return -1;
 
-  ros::spin();
+  driver.spin();
 
   driver.Stop();
 
