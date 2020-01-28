@@ -171,15 +171,24 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   //The first parameter might be inverted
   GetTmpData (0, (unsigned char*)frame->data, &maxtmp, &maxx, &maxy, &mintmp, &minx, &miny, &centertmp, tmparr, temperatureLUT);
 
-  
   //use the LUT to figure out each pixel's float val
-  for (uint32_t i=0; i<(width*(height-4)); i++)
+  for (uint32_t i=0; i<(raw_image->step*(raw_image->height-4)); i+=2)
     {
-      if (raw_image->data[i] > 16384)
-	therm_image->data[i] = 0.0f;
+      uint16_t raw_val = *(uint16_t*)&raw_image->data[i];
+      //ROS_INFO("Data val: %u", raw_val);
+      float real_temp;
+      if (raw_val > 16384)
+	{
+	  real_temp = 0.0f;
+	}
       else
-	therm_image->data[i] = temperatureLUT[raw_image->data[i]]; //bounds checking, etc 
+	{
+	  real_temp = temperatureLUT[raw_val];
+	}
+      //ROS_INFO("Temp val: %1.2f", real_temp);
+      memcpy(&therm_image->data[i*2], &real_temp, sizeof(float));
     }
+  
 
 
   therm_image->header.stamp = timestamp; 
