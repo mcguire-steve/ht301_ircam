@@ -61,7 +61,9 @@ HT301CameraDriver::HT301CameraDriver(ros::NodeHandle nh, ros::NodeHandle priv_nh
     it_(nh_),
     cinfo_manager_(nh) {
   raw_pub_ = it_.advertiseCamera("image_raw", 1, false);
+
   mono_pub_ = it_.advertiseCamera("image_mono", 1, false);
+
   therm_pub_ = it_.advertiseCamera("image_thermal", 1, false);
   
   meta_pub_ = nh_.advertise<ht301_msgs::Ht301MetaData>("metadata", 5, false);
@@ -156,7 +158,31 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   raw_image->step = width * 2;
   raw_image->data.resize(raw_image->step * raw_image->height);
   memcpy(&(raw_image->data[0]), frame->data, frame->data_bytes);
+  
+  therm_image->width = width;
+  therm_image->height = height - 4;
+  therm_image->encoding = "TYPE_32FC1";
+  therm_image->step = width * sizeof(float);
+  therm_image->data.resize(therm_image->step * therm_image->height);
+  
+  
+  //Load the lookup table
+  UpdateParam (0, (unsigned char*) frame->data); //for each frame
+  //The first parameter might be inverted
+  GetTmpData (0, (unsigned char*)frame->data, &maxtmp, &maxx, &maxy, &mintmp, &minx, &miny, &centertmp, tmparr, temperatureLUT);
 
+  
+  //use the LUT to figure out each pixel's float val
+  for (uint32_t i=0; i<(width*(height-4)); i++)
+    {
+      if (raw_image->data[i] > 16384)
+	therm_image->data[i] = 0.0f;
+      else
+	therm_image->data[i] = temperatureLUT[raw_image->data[i]]; //bounds checking, etc 
+    }
+
+  ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
+  
   therm_image->header.stamp = timestamp; 
   therm_image->width = width;
   therm_image->height = height - 4;
@@ -214,7 +240,6 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   */
   
   ht301_msgs::Ht301MetaData::Ptr metadata(new ht301_msgs::Ht301MetaData());
-  
 
   //Push as gray16 image: mono16 for raw values
   //Float data: TYPE_32FC1
@@ -237,8 +262,6 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   mono_image->height = height - 4;
   rgb_image->step = rgb_image->width * 3;
   //rgb_image->data.resize(rgb_image->step * rgb_image->height);
-  */
-  
 
 
 
@@ -254,6 +277,7 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
   cinfo->height = raw_image->height;
 
   mono_pub_.publish(cvThermImage->toImageMsg(), cinfo);
+
 
   raw_pub_.publish(raw_image, cinfo); //not quite right...
   cinfo->height = raw_image->height-4;
@@ -408,16 +432,17 @@ void HT301CameraDriver::CloseCamera() {
 
 
 void HT301CameraDriver::spin() {
+
   ros::Rate r(10); // 10 hz
   while (ros::ok())
     {
-      
       if (frameCount % 200 == 0)
 	{
 	   uvc_set_zoom_abs(devh_,0x8000); //calibrate
 	}
       ros::spinOnce();
       r.sleep();
+
     }
 }
 

@@ -84,6 +84,7 @@ private:
   image_transport::ImageTransport it_;
   image_transport::CameraPublisher raw_pub_;
   image_transport::CameraPublisher mono_pub_;
+
   image_transport::CameraPublisher therm_pub_;
   
   ros::Publisher meta_pub_;
