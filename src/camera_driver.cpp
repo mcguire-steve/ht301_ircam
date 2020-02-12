@@ -189,9 +189,11 @@ void HT301CameraDriver::ImageCallback(uvc_frame_t *frame) {
       memcpy(&therm_image->data[i*2], &real_temp, sizeof(float));
     }
   
-
+  raw_image->header.stamp = timestamp;
+  raw_image->header.frame_id = frame_id;
 
   therm_image->header.stamp = timestamp; 
+  therm_image->header.frame_id = frame_id;
   therm_image->width = width;
   therm_image->height = height - 4;
   therm_image->encoding = "32FC1";
